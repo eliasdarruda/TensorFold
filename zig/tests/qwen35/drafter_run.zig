@@ -385,6 +385,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void
     // frames of two streams at most: a lone stream's holds run frames of one, the pair's frames of two
     const d = try Draft.init(gpa, io, e, args[0], 2);
     defer d.deinit();
+    // these checks read held chains: a hold grows no tree here (the lanes checks run the drafter's trees)
+    d.tree_nodes = 0;
     const loaded = "PASS drafter load: {d:.1} s, a draft step {d:.2} ms (past a one-draft hold)\n";
     std.debug.print(loaded, .{ ms(io, t_load) / 1e3, d.step_ms });
     var streams: [2]lanes.Stream = undefined;

@@ -543,6 +543,11 @@ pub const Engine = struct {
     }
 
     /// Marks a slot of the last verify to keep its first `rows` rows at the next `flush`.
+    /// Keeps a tree's path (window rows from 0, ascending) of slot `slot` at the next flush.
+    pub fn keepPath(e: *Engine, slot: usize, rows: []const u32) !void {
+        try lane_round.markPath(e, slot, rows);
+    }
+
     pub fn keep(e: *Engine, slot: usize, rows: usize) void {
         lane_round.mark(e, slot, rows);
     }

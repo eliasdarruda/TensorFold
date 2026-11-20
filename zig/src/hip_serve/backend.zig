@@ -41,7 +41,12 @@ pub const Fill = struct {
 };
 
 /// The last verify's rows until their keep: how many, and the slot a shared round keeps them from.
-pub const Pending = struct { rows: usize, slot: usize = 0 };
+pub const Pending = struct {
+    rows: usize,
+    slot: usize = 0,
+    /// A tree window: it keeps a path the round loop names, never all its rows as a chain.
+    tree: bool = false,
+};
 
 /// The tokens drawn so far, each named by its handle.
 pub const Drawn = struct {
@@ -145,11 +150,31 @@ pub fn Streams(comptime Lane: type) type {
 
 /// The window's tokens into `out`: the pending token, then the drafts `held` or sent; `len` the stream's kept slots.
 pub fn windowTokens(w: be.Window, held: []const u32, len: usize, out: []u32) !usize {
-    if (w.parents != null) return error.TreesNotBuilt;
+    return windowRows(w, held, len, out, false);
+}
+
+/// `windowTokens` for a family whose rounds take trees (`trees`): a tree (`w.parents`, row 0's -1, parents first)
+/// keys each row at its depth, the window's start plus its depth; without `trees` a tree is refused.
+pub fn windowRows(w: be.Window, held: []const u32, len: usize, out: []u32, trees: bool) !usize {
+    if (w.parents != null and !trees) return error.TreesNotBuilt;
     if (w.held > held.len or (w.held > 0 and w.tokens.len > 0)) return error.NoHeldDrafts;
     const n = w.rows();
     if (n > out.len) return error.WindowTooWide;
-    for (w.positions, 0..) |p, r| if (p != len + 1 + r) {
+    var depth: [64]usize = undefined;
+    if (w.parents) |ps| {
+        // a tree's rows come from the host (a drafter's tree), never from drafts the backend holds
+        if (ps.len != n or n > depth.len or w.held > 0) return error.BadTree;
+        for (ps, 0..) |q, r| {
+            if (r == 0) {
+                if (q != -1) return error.BadTree;
+                depth[0] = 0;
+            } else {
+                if (q < 0 or q >= @as(i32, @intCast(r))) return error.BadTree;
+                depth[r] = depth[@intCast(q)] + 1;
+            }
+        }
+    }
+    for (w.positions, 0..) |p, r| if (p != len + 1 + if (w.parents != null) depth[r] else r) {
         std.log.err("row {d} keyed at {d}, the stream holds {d} slots", .{ r, p, len });
         return error.PositionMismatch;
     };
@@ -178,13 +203,25 @@ pub fn firstToken(drawn: *const Drawn, r: be.DraftRequest) !u32 {
 
 /// A verify the round loop did not trim keeps every row (the core keeps only on drops).
 pub fn settle(h: anytype, lane: anytype) !void {
-    if (lane.pending) |p| try h.keepRows(lane, p.rows);
+    if (lane.pending) |p| {
+        if (p.tree) return error.TreeNotKept;
+        try h.keepRows(lane, p.rows);
+    }
 }
 
-/// Before a draft: the rows the request names kept, or every pending row.
+/// Before a draft: the rows the request names kept (a tree's path where the family keeps one), or every pending row.
 pub fn keepFor(h: anytype, lane: anytype, r: be.DraftRequest) !void {
     if (lane.pending == null) return;
-    if (r.rows) |kept| try h.keepRows(lane, kept.len) else try settle(h, lane);
+    if (r.rows) |kept| try keepRowsOf(h, lane, kept) else try settle(h, lane);
+}
+
+/// The kept rows of a window: a prefix as a count, a tree's path by a family that keeps paths.
+pub fn keepRowsOf(h: anytype, lane: anytype, kept: []const u32) !void {
+    for (kept, 0..) |r, j| if (r != j) {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(h)).pointer.child, "keepPath")) return h.keepPath(lane, kept);
+        return error.TreesNotBuilt;
+    };
+    try h.keepRows(lane, kept.len);
 }
 
 /// The lane core's backend over family `F`: its `streams`, `tp`, `e.ctx` and `F.Lane`, and the hooks `vtable` calls.
@@ -323,10 +360,9 @@ pub fn Backend(comptime F: type) type {
             defer h.streams.timed(1, began);
             for (windows, paths) |w, path| {
                 const lane = try h.streams.get(w.stream);
-                for (path, 0..) |r, j| if (r != j) return error.TreesNotBuilt;
                 // the draft request of the same round may have kept these rows already
                 if (lane.pending == null) continue;
-                try h.keepRows(lane, path.len);
+                try keepRowsOf(h, lane, path);
             }
             try h.flush();
         }

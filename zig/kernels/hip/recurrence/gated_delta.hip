@@ -98,9 +98,15 @@ __device__ __forceinline__ void
 gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                       const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
                       float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
-                      float* __restrict__ states, int batch, bool write_back = true) {
+                      float* __restrict__ states, int batch, bool write_back = true,
+                      const int* __restrict__ tree_depth = nullptr,
+                      const unsigned long long* __restrict__ tree_path = nullptr,
+                      unsigned long long kept = 0, bool keep = false) {
     constexpr int SPAN = (DK + 31) / 32;
     constexpr int WIDTH = 32 * ROWS;
+    // a tree window's rows read their own inputs (tree_depth, tree_path: its rows'); a keep's step t reads its t-th
+    // kept row (`kept`, a nibble each: a tree's path, a chain's 0, 1, 2, ...)
+    auto row_of = [&](int t) { return keep ? plan_nibble(kept, t) : t; };
     const int lane = threadIdx.x;
     const int local = threadIdx.y;
     const int row = blockIdx.x * ROWS + local;
@@ -130,7 +136,7 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
             const int step = elem / DK;
             const int col = elem - step * DK;
             const size_t at =
-                ((static_cast<size_t>(batch) * length + (t0 + step)) * key_heads + key_head) * DK + col;
+                ((static_cast<size_t>(batch) * length + row_of(t0 + step)) * key_heads + key_head) * DK + col;
             const float4 key = *reinterpret_cast<const float4*>(k + at);
             ks[step][col] = key.x;
             ks[step][col + 1] = key.y;
@@ -145,19 +151,20 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
             qs[step][col + 3] = query.w;
         }
         for (int i = tid; i < n; i += WIDTH) {
-            const size_t step = (static_cast<size_t>(batch) * length + (t0 + i)) * value_heads + head;
+            const size_t step = (static_cast<size_t>(batch) * length + row_of(t0 + i)) * value_heads + head;
             gs[i] = gate[step];
             bs[i] = beta[step];
         }
         for (int i = tid; i < n * ROWS; i += WIDTH) {
             const int step = i / ROWS;
             const int which = i - step * ROWS;
-            vs[step][which] = v[((static_cast<size_t>(batch) * length + (t0 + step)) * value_heads + head) * dv +
+            vs[step][which] = v[((static_cast<size_t>(batch) * length + row_of(t0 + step)) * value_heads + head) * dv +
                                 blockIdx.x * ROWS + which];
         }
         __syncthreads();
 
-        for (int tt = 0; tt < n; ++tt) {
+        // one step of the recurrence on staged step tt: every row's update, a tree's rebuild alike
+        auto advance = [&](int tt) {
             const float decay = gs[tt];
             const float step_beta = bs[tt];
             const float value = vs[tt][local];
@@ -178,6 +185,23 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
                 const int idx = lane + i * 32;
                 if (idx < DK) s[i] = s[i] + held[i] * delta;
             }
+        };
+        for (int tt = 0; tt < n; ++tt) {
+            // a tree row after another branch: its parent's state from the window's start and its ancestors, in order
+            // (a tree window fits one stage of STEPS rows, and keeps the round's start state for its keep)
+            const int r = t0 + tt;
+            const int depth = tree_depth != nullptr ? tree_depth[r] : r;
+            const int parent = depth == 0 ? -1 : depth > kTreeRows ? r - 1 : plan_nibble(tree_path[r], depth - 1);
+            if (tree_depth != nullptr && r > 0 && parent != r - 1) {
+#pragma unroll
+                for (int i = 0; i < SPAN; ++i) {
+                    const int idx = lane + i * 32;
+                    if (idx < DK) s[i] = state[state_row + idx];
+                }
+                const unsigned long long path = tree_path[r];
+                for (int a = 0; a < depth; ++a) advance(plan_nibble(path, a) - t0);
+            }
+            advance(tt);
             if (states != nullptr) {
                 const size_t snap =
                     (((static_cast<size_t>(batch) * length + (t0 + tt)) * value_heads + head) * dv + row) * DK;
@@ -236,7 +260,8 @@ gated_delta_plan_body(const float* q, const float* k, const float* v, const floa
     gated_delta_tile_body<DK, 8, 16>(q + row0 * key_heads * DK, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
                                      gate + row0 * value_heads, beta + row0 * value_heads, state,
                                      y + row0 * value_heads * dv, length, key_heads, value_heads, dv, nullptr, 0,
-                                     !replayed);
+                                     !replayed, plan.depth != nullptr ? plan.depth + row0 : nullptr,
+                                     plan.path != nullptr ? plan.path + row0 : nullptr);
 }
 
 // A keep: each slot's state run from the round's start through its kept rows, by the same scan on the inputs kept.
@@ -253,9 +278,11 @@ __device__ __forceinline__ void gated_delta_replay_body(const int* keep, int row
     const float* gate = v + static_cast<long long>(rows) * value_heads * dv;
     const float* beta = gate + static_cast<long long>(rows) * value_heads;
     float* state = reinterpret_cast<float*>(plan_desc(plan, slot)[plan_second(layer)]);
+    // a tree's keep replays its path's rows in order (plan.kept); a chain's, its first n
     gated_delta_tile_body<DK, 8, 16>(nullptr, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
                                      gate + row0 * value_heads, beta + row0 * value_heads, state, nullptr, n, key_heads,
-                                     value_heads, dv, nullptr, 0);
+                                     value_heads, dv, nullptr, 0, true, nullptr, nullptr,
+                                     plan.kept != nullptr ? plan.kept[slot] : 0xfedcba9876543210ull, true);
 }
 
 // A prompt's recurrence for DK = DV = 128, 4 lanes a row and 2 rows a lane; lane0_sum's sums in its order, same bits.

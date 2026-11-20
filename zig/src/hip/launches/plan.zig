@@ -19,6 +19,11 @@ pub const PlanArgs = extern struct {
     snaps: u64 = 0,
     pages: u32 = 0,
     pool: u32 = 0,
+    /// Trees (zero: every window a chain): each row's depth (i32), its path from its window's first row (u64, a
+    /// nibble a depth) and each slot's kept rows at a keep (u64, a nibble each), as plan.hpp reads them.
+    depth: u64 = 0,
+    path: u64 = 0,
+    kept: u64 = 0,
 };
 
 /// A plan's shape: `rows` rows (a bucket, padding included) over `slots` slots.
@@ -309,6 +314,20 @@ pub fn planKeep(l: *const Launcher, p: PlanRef, k: Keep, s: S) Error!void {
     try a.add(@as(c_int, @intCast(k.taps)));
     try a.add(@as(c_int, @intCast(k.layers)));
     try l.go(l.plan.keep, dim(64, k.layers + 1, p.slots), dim(256, 1, 1), 0, s, &a);
+}
+
+/// A tree keep's moves: each listed slot's kept rows' keys and values to their logical positions, every full layer
+/// `full` lists (device i32s), a block a (KV head, layer, slot); a chain's keep moves nothing.
+pub fn planKeepKv(l: *const Launcher, p: PlanRef, keep: u64, full: u64, layers: usize, kv_heads: usize, d: usize, s: S) Error!void {
+    if (layers == 0 or p.args.kept == 0) return;
+    if (d > 256 or kv_heads < 1) return invalid("planned keep moves");
+    var a: Args = .{};
+    try a.add(p.args);
+    try a.add(keep);
+    try a.add(full);
+    try a.add(@as(c_int, @intCast(kv_heads)));
+    try a.add(@as(c_int, @intCast(d)));
+    try l.go(l.plan.keep_kv, dim(kv_heads, layers, p.slots), dim(256, 1, 1), 0, s, &a);
 }
 
 /// The kept slots' DeltaNet states run through their kept rows, every linear layer in one launch.

@@ -59,6 +59,17 @@ pub fn startPlan(tree: anytype, s: *const lanes.Stream, owner: anytype, matched:
     return tree.begin(if (s.key.len != 0) s.key else s.prompt(), s.history_len, s.shared_prefixes, owner, matched);
 }
 
+/// TF_TREE_LOG=1: each tree window and tree keep in the log (for checks).
+const tree_log_env = "TF_TREE_LOG";
+var tree_log_read = false;
+var tree_log = false;
+
+fn treeLogOn() void {
+    if (tree_log_read) return;
+    tree_log = @import("sys").c.getenv(tree_log_env) != null;
+    tree_log_read = true;
+}
+
 pub const Lane = struct {
     caches: state.Caches,
     vision: ?vision.Request = null,
@@ -78,6 +89,9 @@ pub const Lane = struct {
     fill: ?glue.Fill = null,
     /// The last verify's slot and rows: kept whole unless keep drops some first.
     pending: ?glue.Pending = null,
+    /// Cache positions the last verify's window wrote up to: a tree's kept path names rows past its kept length,
+    /// whose taps the drafter still reads until the next verify.
+    window_end: usize = 0,
     /// A structured reply's prompt row, kept for its masked first draw (null for the others).
     first_row: ?[]u16 = null,
     /// A readout stream's state, opened in `begin` and closed in `free`.
@@ -243,6 +257,23 @@ pub const Hip = struct {
         lane.pending = null;
     }
 
+    /// Marks the pending window's tree path kept (window rows from 0, ascending; a prefix keeps as a chain): the
+    /// path's rows take the cache positions after the stream's length, and `flush` lands them.
+    pub fn keepPath(h: *Hip, lane: *Lane, path: []const u32) !void {
+        var chain = true;
+        for (path, 0..) |r, j| chain = chain and r == j;
+        if (chain) return h.keepRows(lane, path.len);
+        // the other ranks hear a keep as a row count: a tree's keep runs on one rank
+        if (h.e.o.world != 1) return error.TreesUnderTensorParallel;
+        const p = lane.pending.?;
+        if (path[path.len - 1] >= p.rows) return error.BadDraftRows;
+        if (tree_log) std.log.info("tree keep: path {any} of {d} rows", .{ path, p.rows });
+        try h.e.keepPath(p.slot, path);
+        try h.marked.append(h.gpa, .{ lane.id, @intCast(path.len) });
+        lane.len += path.len;
+        lane.pending = null;
+    }
+
     /// Lands the marked keeps in one launch: linear states after the kept rows, the last kept final row for the head.
     pub fn flush(h: *Hip) !void {
         if (h.marked.items.len == 0) return;
@@ -389,6 +420,7 @@ pub const Hip = struct {
     /// Each stream's window from its kept length: the pending token, then the host's drafts; one forward for all.
     pub fn verify(h: *Hip, windows: []const be.Window, out: []be.Verified) !void {
         if (windows.len > h.order.len) return error.WindowTooWide;
+        treeLogOn();
         // windows the round loop did not trim keep every row before this round's plan replaces theirs
         for (windows) |w| try glue.settle(h, try h.streams.get(w.stream));
         try h.flush();
@@ -401,8 +433,11 @@ pub const Hip = struct {
         if (windows.len > rows.len) return error.WindowTooWide;
         for (windows, 0..) |w, i| {
             const lane = try h.streams.get(w.stream);
-            const n = try glue.windowTokens(w, lane.held[0..lane.held_n], lane.len, &tokens[i]);
-            rows[i] = .{ .caches = &lane.caches, .pos = lane.len, .tokens = tokens[i][0..n], .shift = if (lane.vision) |v| v.layout.shift else 0 };
+            const n = try glue.windowRows(w, lane.held[0..lane.held_n], lane.len, &tokens[i], true);
+            // a tree runs on one rank (its keep is a path the other ranks do not hear), from a drafter's tree
+            if (w.parents != null and h.e.o.world != 1) return error.TreesUnderTensorParallel;
+            rows[i] = .{ .caches = &lane.caches, .pos = lane.len, .tokens = tokens[i][0..n], .shift = if (lane.vision) |v| v.layout.shift else 0, .parents = w.parents };
+            if (w.parents != null and tree_log) std.log.info("tree window: {d} rows from {d}, parents {any}", .{ n, lane.len, w.parents.? });
             h.order[i] = w.stream;
         }
         var reqs: [256]draw.Request = undefined;
@@ -428,7 +463,8 @@ pub const Hip = struct {
             const lane = h.streams.map.get(w.stream).?;
             @memcpy(o.drafts, if (w.held > 0) lane.held[0..w.held] else w.tokens);
             lane.held_n = 0;
-            lane.pending = .{ .slot = i, .rows = w.rows() };
+            lane.pending = .{ .slot = i, .rows = w.rows(), .tree = w.parents != null };
+            lane.window_end = lane.len + w.rows();
             at += w.rows();
         }
     }
@@ -496,7 +532,8 @@ pub const Hip = struct {
         if (taps.len != t.n or !std.mem.eql(u32, taps, t.layers[0..t.n])) return error.TapsMismatch;
         const ring = lane.caches.tap orelse return error.NoTaps;
         // a verify's rows are in the ring before its keep: they count as written until the keep drops them
-        const written = lane.len + if (lane.pending) |p| p.rows else 0;
+        // a tree's kept rows may lie past its kept length: they stay in the ring until the next verify
+        const written = @max(lane.len + if (lane.pending) |p| p.rows else 0, lane.window_end);
         const end = start + count;
         // a resumed lane's ring holds zeros below its resume point: the snapshot keeps no tap rows
         if (count == 0 or start < lane.tapped_from or end > written) return error.RowsNotHeld;

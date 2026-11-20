@@ -283,6 +283,9 @@ __device__ void conv_split_body(const ConvArgs& launch) {
     __shared__ float inv_s;
     ConvArgs c = launch;
     float* samples = nullptr;
+    // a tree window's rows take their ancestors' inputs as their past (plan.hpp), from the window's first state
+    bool tree = false;
+    long long tree_row0 = 0;
     const int conv_blocks = (c.channels + 127) / 128;
     if (launch.plan.count != nullptr) {
         const int slot = blockIdx.y;
@@ -302,6 +305,8 @@ __device__ void conv_split_body(const ConvArgs& launch) {
             const bool replayed = rows > 1 && slot + 1 < static_cast<int>(gridDim.y);
             c.states = nullptr;
             samples = replayed ? reinterpret_cast<float*>(launch.plan.snaps[2 * launch.layer]) + row0 * c.channels : nullptr;
+            tree = replayed && launch.plan.depth != nullptr;
+            tree_row0 = row0;
         }
     }
     if (blockIdx.x >= conv_blocks) {
@@ -326,6 +331,17 @@ __device__ void conv_split_body(const ConvArgs& launch) {
     for (int r = 0; r < c.rows; ++r) {
         float y = 0.f;
         float sample = 0.f;
+        if (live && tree && r > 0 && plan_parent(launch.plan, static_cast<int>(tree_row0), r) != r - 1) {
+            // after another branch: the window's first state, then the ancestors' inputs in order
+            for (int tap = 0; tap < kept; ++tap) history[tap] = c.state[static_cast<long long>(tap) * c.channels + channel];
+            const int depth = launch.plan.depth[tree_row0 + r];
+            const unsigned long long path = launch.plan.path[tree_row0 + r];
+            for (int a = 0; a < depth; ++a) {
+                const float past = load_kind(c.x, c.kind, static_cast<long long>(plan_nibble(path, a)) * c.channels + channel);
+                for (int tap = 0; tap < kept - 1; ++tap) history[tap] = history[tap + 1];
+                if (kept > 0) history[kept - 1] = past;
+            }
+        }
         if (live) {
             float acc = 0.f;
             for (int tap = 0; tap < kept; ++tap) acc += history[tap] * taps[tap];

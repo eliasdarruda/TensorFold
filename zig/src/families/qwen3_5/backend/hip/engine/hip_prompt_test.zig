@@ -410,6 +410,7 @@ test "a resumed lane's features start at its resume point; a fresh lane's at row
     lane.caches.tap = .{ .r = undefined, .ptr = &ring, .len = ring.len };
     lane.len = 200; // a 200-row prompt, every row still in the ring
     lane.pending = null;
+    lane.window_end = 0;
     const taps = [_]u32{ 5, 19 };
     lane.tapped_from = 0;
     try T.expectEqual(@as(u32, 16), (try h.features(&lane, &taps, 0, 16)).rows);

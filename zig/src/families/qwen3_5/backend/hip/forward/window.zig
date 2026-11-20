@@ -101,9 +101,13 @@ fn inputNorm(layer: view.Layer) u64 {
     };
 }
 
-/// Keeps the slots `counts` lists (negative: none): linear layers replay their kept rows, `hidden` gets the last.
-pub fn keep(o: Ops, m: *const view.Model, p: pops.Plan, counts: u64, hidden: u64) hip.ops.Error!void {
+/// Keeps the slots `counts` lists (negative: none): linear layers replay their kept rows, `hidden` gets the last;
+/// a tree's keep (the plan's kept paths) also moves its kept keys and values in the `full` layers' caches.
+pub fn keep(o: Ops, m: *const view.Model, p: pops.Plan, counts: u64, hidden: u64, full: u64) hip.ops.Error!void {
     const s = m.spec;
+    var full_layers: usize = 0;
+    for (0..s.n_layers) |i| full_layers += @intFromBool(s.full(i));
+    try pops.keepKv(o, p, counts, full, full_layers, s.kv_heads, s.head_dim);
     try pops.keep(o, p, .{
         .keep = counts,
         .hidden = hidden,

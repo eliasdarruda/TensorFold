@@ -145,6 +145,12 @@ pub fn keep(o: Ops, p: Plan, k: Keep) Error!void {
     try (try launcher(o)).planKeep(p, k, o.stream);
 }
 
+/// A tree keep's kept keys and values moved to their logical positions, the full layers `full` lists (see
+/// `launches.planKeepKv`); nothing without trees.
+pub fn keepKv(o: Ops, p: Plan, keep_counts: u64, full: u64, layers: usize, kv_heads: usize, d: usize) Error!void {
+    try (try launcher(o)).planKeepKv(p, keep_counts, full, layers, kv_heads, d, o.stream);
+}
+
 /// The kept slots' DeltaNet states replayed through their kept rows (see `launches.planGdnReplay`).
 pub fn gdnReplay(o: Ops, keep_counts: u64, p: Plan, key_heads: usize, value_heads: usize, dk: usize, dv: usize, layers: usize) Error!void {
     try (try launcher(o)).planGdnReplay(keep_counts, p, key_heads, value_heads, dk, dv, layers, o.stream);

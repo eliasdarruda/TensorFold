@@ -73,11 +73,12 @@ __device__ __forceinline__ float cache_load(const void* p, int kind, long long i
 // A wave's KEYS keys from key0 at d = 256 into k, lane l taking elements l + 32 i; keys past `visible` are not loaded.
 template <int KEYS>
 __device__ __forceinline__ void score_fetch(float (&k)[KEYS][8], const void* keys, int kind, const unsigned* pages,
-                                            unsigned pool, int kv, int key0, int visible, int lane) {
+                                            unsigned pool, int kv, int key0, int visible, int lane,
+                                            const PlanSees& sees) {
 #pragma unroll
     for (int j = 0; j < KEYS; ++j) {
         if (key0 + j >= visible) break;
-        const long long base = page_at(pages, pool, kv, key0 + j, 256);
+        const long long base = page_at(pages, pool, kv, plan_key(sees, key0 + j), 256);
 #pragma unroll
         for (int i = 0; i < 8; ++i) k[j][i] = cache_load(keys, kind, base + lane + i * 32);
     }
@@ -109,7 +110,8 @@ __device__ void plan_score_body(const void* __restrict__ q, float* __restrict__ 
         for (int i = threadIdx.x; i < group * d; i += blockDim.x) qs[i] = load(q, QKIND, q0 + i);
     }
     __syncthreads();
-    const int visible = min(plan.pos[batch] + 1, span);
+    // a tree's row walks its logical positions: its window's start plus its depth, its ancestors' keys
+    const int visible = min(plan_see(plan, batch) + 1, span);
     const int lane = threadIdx.x & 31;
     const int key0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * KEYS;
     float kreg[KEYS][8] = {};
@@ -118,10 +120,11 @@ __device__ void plan_score_body(const void* __restrict__ q, float* __restrict__ 
         const void* keys = reinterpret_cast<const void*>(desc[plan_first(layer)]);
         const unsigned* pages = plan_pages(plan, desc);
         const int kv = head0 / (heads / kv_heads);
+        const PlanSees sees = plan_sees(plan, batch);
 #pragma unroll
         for (int j = 0; j < KEYS; ++j) {
             if (key0 + j >= visible) break;
-            const long long base = page_at(pages, plan.pool, kv, key0 + j, d);
+            const long long base = page_at(pages, plan.pool, kv, plan_key(sees, key0 + j), d);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int idx = lane + i * 32;
@@ -165,7 +168,8 @@ __device__ void plan_score256_body(const void* __restrict__ q, float* __restrict
     const long long q0 = (static_cast<long long>(batch) * heads + head0) * d;
     for (int i = threadIdx.x; i < group * d; i += blockDim.x) qs[i] = load(q, QKIND, q0 + i);  // kind 0: q fp32
     __syncthreads();
-    const int visible = min(plan.pos[batch] + 1, span);
+    const int visible = min(plan_see(plan, batch) + 1, span);
+    const PlanSees sees = plan_sees(plan, batch);
     const int lane = threadIdx.x & 31;
     const unsigned long long* desc = plan_desc(plan, plan.slot[batch]);
     float* __restrict__ rows = scores + (static_cast<long long>(batch) * heads + head0) * span;
@@ -177,13 +181,14 @@ __device__ void plan_score256_body(const void* __restrict__ q, float* __restrict
     const int first = blockIdx.x * STEPS * stride + (threadIdx.x >> 5) * KEYS;
     const bool whole = (span % KEYS) == 0 && (reinterpret_cast<unsigned long long>(rows) & 15) == 0;
     float kreg[KEYS][8] = {};
-    score_fetch<KEYS>(kreg, keys, KIND, pages, pool, kv, first, visible, lane);
+    score_fetch<KEYS>(kreg, keys, KIND, pages, pool, kv, first, visible, lane, sees);
 #pragma unroll 1
     for (int step = 0; step < STEPS; ++step) {
         const int key0 = first + step * stride;
         if (key0 >= span) break;  // the same for the whole wave
         float next[KEYS][8] = {};
-        score_fetch<KEYS>(next, keys, KIND, pages, pool, kv, step + 1 < STEPS ? key0 + stride : span, visible, lane);
+        score_fetch<KEYS>(next, keys, KIND, pages, pool, kv, step + 1 < STEPS ? key0 + stride : span, visible, lane,
+                          sees);
         if (key0 >= visible) {  // the wave's keys are all past the row's: -INFINITY wherever the span has them
             float none[KEYS];
             for (int j = 0; j < KEYS; ++j) none[j] = -INFINITY;
@@ -225,7 +230,8 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
                                   PlanArgs plan, int layer) {
     __shared__ float weights[kMaxGroup * 128];
     const int batch = blockIdx.z;
-    const int visible = min(plan.pos[batch] + 1, span);
+    const int visible = min(plan_see(plan, batch) + 1, span);
+    const PlanSees sees = plan_sees(plan, batch);
     const int tile = blockIdx.x;
     const int group = heads / gridDim.y;
     const int head0 = blockIdx.y * group;
@@ -251,9 +257,11 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
     const unsigned* table = plan_pages(plan, desc);
     const int kv = head0 / (heads / kv_heads);
     float acc[kMaxGroup] = {};
+    // a tree's window keys (its ancestors') come one by one after the cache's, still summed in key order
+    const int paged = sees.tree ? max(key0, min(stop, sees.base)) : stop;
     // a page at a time: its table entry is read once, and the keys are summed in order
-    for (int key = key0; key < stop;) {
-        const int edge = min((key / kPageTokens + 1) * kPageTokens, stop);
+    for (int key = key0; key < paged;) {
+        const int edge = min((key / kPageTokens + 1) * kPageTokens, paged);
         const long long slot0 = page_row(table[key / kPageTokens], plan.pool, kv, 0, d) + lane;
         // eight values loaded ahead, then summed in key order: the loads overlap, the sums are the same
         for (; key + 8 <= edge; key += 8) {
@@ -277,6 +285,13 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
             }
         }
     }
+    for (int key = paged; key < stop; ++key) {
+        const float value = load(values, KIND, page_at(table, plan.pool, kv, plan_key(sees, key), d) + lane);
+#pragma unroll
+        for (int g = 0; g < kMaxGroup; ++g) {
+            if (g < group) acc[g] += weights[g * 128 + key - key0] * value;
+        }
+    }
 #pragma unroll
     for (int g = 0; g < kMaxGroup; ++g) {
         if (g < group) partials[((first + g) * gridDim.x + tile) * d + lane] = acc[g];
@@ -297,7 +312,8 @@ __device__ void plan_attend_body(const void* __restrict__ q, int qkind, void* __
     __shared__ float qs[kAttendTile];
     __shared__ float buf[256];
     const int head = blockIdx.x, batch = blockIdx.y, tid = threadIdx.x;
-    const int visible = min(plan.pos[batch] + 1, span);
+    const int visible = min(plan_see(plan, batch) + 1, span);
+    const PlanSees sees = plan_sees(plan, batch);
     const long long q0 = (static_cast<long long>(batch) * heads + head) * d;
     for (int i = tid; i < d; i += kAttendThreads) qs[i] = load(q, qkind, q0 + i);
     __syncthreads();
@@ -314,7 +330,7 @@ __device__ void plan_attend_body(const void* __restrict__ q, int qkind, void* __
 #pragma unroll
             for (int j = 0; j < kAhead; ++j) {
                 const int key = key0 + j < visible ? key0 + j : visible - 1;
-                const long long base = page_at(table, plan.pool, kv, key, d);
+                const long long base = page_at(table, plan.pool, kv, plan_key(sees, key), d);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const int idx = lane + i * 32;
@@ -370,8 +386,9 @@ __device__ void plan_attend_body(const void* __restrict__ q, int qkind, void* __
         float acc = 0.f;
         if (key0 < visible && col < d) {
             const int stop = min(key0 + kAttendTile, visible);
-            for (int key = key0; key < stop;) {
-                const int edge = min((key / kPageTokens + 1) * kPageTokens, stop);
+            const int paged = sees.tree ? max(key0, min(stop, sees.base)) : stop;
+            for (int key = key0; key < paged;) {
+                const int edge = min((key / kPageTokens + 1) * kPageTokens, paged);
                 const long long slot0 = page_row(table[key / kPageTokens], plan.pool, kv, 0, d) + col;
                 for (; key + 8 <= edge; key += 8) {
                     float ahead[8];
@@ -384,6 +401,9 @@ __device__ void plan_attend_body(const void* __restrict__ q, int qkind, void* __
                 for (; key < edge; ++key) {
                     acc += wt[key] * load(values, KIND, slot0 + static_cast<long long>(key % kPageTokens) * d);
                 }
+            }
+            for (int key = paged; key < stop; ++key) {
+                acc += wt[key] * load(values, KIND, page_at(table, plan.pool, kv, plan_key(sees, key), d) + col);
             }
         }
         if (col < d) part[tile][col] = acc;
@@ -551,7 +571,8 @@ tf_plan_keep(PlanArgs plan, const int* keep, const unsigned int* hidden, int hid
     if (n < 0) return;
     const unsigned long long* desc = plan_desc(plan, slot);
     if (blockIdx.y == layers) {
-        const int row = plan.first[slot] + n - 1;
+        // a tree's keep lists its path: the last listed row's final row
+        const int row = plan.first[slot] + plan_kept(plan, slot, n - 1);
         if (desc[1] != 0) copy_words(reinterpret_cast<unsigned int*>(desc[1]), hidden + static_cast<long long>(row) * hidden_words, hidden_words);
         return;
     }
@@ -559,12 +580,42 @@ tf_plan_keep(PlanArgs plan, const int* keep, const unsigned int* hidden, int hid
     if (plan.count[slot] <= 1 || plan.snaps[2 * layer] == 0) return;
     float* window = reinterpret_cast<float*>(desc[plan_first(layer)]);
     const float* samples = reinterpret_cast<const float*>(plan.snaps[2 * layer]) + static_cast<long long>(plan.first[slot]) * channels;
-    // tap t takes position n - taps + t of the round's first window followed by its rows: ascending taps read ahead
+    // tap t takes position n - taps + t of the round's first window followed by its kept rows (a tree's path, in
+    // order): ascending taps read ahead
     for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < channels; c += gridDim.x * blockDim.x) {
         for (int t = 0; t < taps; ++t) {
             const int at = n - taps + t;
-            window[static_cast<long long>(t) * channels + c] = at < 0 ? window[static_cast<long long>(taps + at) * channels + c] : samples[static_cast<long long>(at) * channels + c];
+            window[static_cast<long long>(t) * channels + c] = at < 0 ? window[static_cast<long long>(taps + at) * channels + c] : samples[static_cast<long long>(plan_kept(plan, slot, at)) * channels + c];
         }
+    }
+}
+
+// A tree's keep moves each kept row's keys and values from its cache position (its window's start plus its row) to
+// its logical one (the start plus its place on the path), every full layer `full` lists; a chain's rows stay put.
+// A block a (slot, listed layer, KV head) walks the path in order: a row never lands on one the path still reads.
+__global__ void __launch_bounds__(256)
+tf_plan_keep_kv(PlanArgs plan, const int* keep, const int* full, int kv_heads, int d) {
+    const int slot = blockIdx.z;
+    const int n = keep[slot];
+    if (n <= 1 || plan.kept == nullptr) return;
+    const unsigned long long* desc = plan_desc(plan, slot);
+    const int layer = full[blockIdx.y];
+    const int h = blockIdx.x;
+    const unsigned* pages = plan_pages(plan, desc);
+    uint16_t* keys = static_cast<uint16_t*>(reinterpret_cast<void*>(desc[plan_first(layer)]));
+    uint16_t* values = static_cast<uint16_t*>(reinterpret_cast<void*>(desc[plan_second(layer)]));
+    const int base = plan.pos[plan.first[slot]];
+    for (int t = 1; t < n; ++t) {
+        const int row = plan_kept(plan, slot, t);
+        if (row != t) {
+            const long long from = page_at(pages, plan.pool, h, base + row, d);
+            const long long to = page_at(pages, plan.pool, h, base + t, d);
+            for (int j = threadIdx.x; j < d; j += blockDim.x) {
+                keys[to + j] = keys[from + j];
+                values[to + j] = values[from + j];
+            }
+        }
+        __syncthreads();
     }
 }
 

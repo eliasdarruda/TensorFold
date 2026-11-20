@@ -12,6 +12,7 @@ const draft_prior = @import("../../../draft_prior.zig");
 
 const E = engine.Engine;
 const dr = lanes.drafter;
+const walker = lanes.draft_tree;
 const Stream = lanes.Stream;
 const Ctx = context.Ctx;
 
@@ -52,6 +53,11 @@ pub const Draft = struct {
     costs: [16]lanes.config.Cost = undefined,
     n_costs: usize = 0,
     times: Times = .{},
+    /// Nodes a hold grows best first from the block's candidates (draft_tree.grow; TF_DRAFT_NODES, 0 with
+    /// TF_NO_TREES): the target verifies them as one tree window. 0: chains.
+    tree_nodes: usize = 0,
+    /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
+    landing: walker.Landing = .{},
 
     /// The drafter of `dir` on the target `e`, whose taps must already be the drafter's; frames of `streams` at most.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8, streams: usize) !*Draft {
@@ -59,6 +65,8 @@ pub const Draft = struct {
         if (streams == 0 or streams > max_streams) return error.BadDraftFrame;
         if (m.tp != null or m.act.size() != 2) return error.UnsupportedTarget;
         const c = try config.Config.read(gpa, io, dir, config.Target.of(m.spec));
+        // a tree window is the target's whole window at most: the pending row and its nodes
+        const nodes = try walker.nodes(tree_window, @import("sys").c.getenv("TF_NO_TREES") != null);
         if (!std.mem.eql(u32, c.tapLayers(), m.taps.layers[0..m.taps.n])) return error.TapsMismatch;
         if (m.head.n != c.vocab or c.block - 1 > context.most_held) return error.UnsupportedDraftConfig;
         const d = try gpa.create(Draft);
@@ -77,6 +85,7 @@ pub const Draft = struct {
             .blank = undefined,
             .logits = &.{},
             .projected = &.{},
+            .tree_nodes = @min(nodes, context.most_held),
         };
         d.w = try weights.load(gpa, io, &e.driver, dir, weights.Shape.of(c));
         errdefer d.w.deinit();
@@ -252,10 +261,18 @@ pub const Draft = struct {
         }
     }
 
-    fn frameOf(d: *Draft, items: []const dr.Hold, contexts: []const *Ctx) !void {
+    fn frameOf(d: *Draft, holds: []const dr.Hold, contexts: []const *Ctx) !void {
         const c = d.c;
         const l = d.layout;
         const st = d.scalars.bytes;
+        // a tree's depth is its nodes: the frame runs the rows they can reach, the block's at most
+        var clamped: [max_streams]dr.Hold = undefined;
+        if (holds.len > clamped.len) return error.BadDraftFrame;
+        for (holds, clamped[0..holds.len]) |it, *x| {
+            x.* = it;
+            if (d.tree_nodes > 0 and it.lanes == null) x.depth = @min(it.depth, @as(u32, @intCast(c.block - 1)));
+        }
+        const items = clamped[0..holds.len];
         // a frame's rows are its deepest hold's: the round loop prices a hold by the drafts it asks
         const block = context.frameBlock(items, c.block);
         const B = items.len * block;
@@ -297,6 +314,14 @@ pub const Draft = struct {
                 .sampling = it.sampling,
                 .position = it.position,
             };
+            ctx.grown = 0;
+            if (d.tree_nodes > 0 and it.lanes == null and it.depth > 0) {
+                // best first over the frame's rows: as many nodes as the round loop asked, up to the budget
+                const n = @min(holds[i].depth, d.tree_nodes);
+                ctx.grown = walker.grow(tree_window, cand, it.pending, per, n, &ctx.held, &ctx.parents, &ctx.own);
+                ctx.held_n = ctx.grown;
+                continue;
+            }
             select.chain(cand, it.pending, ctx.held[0..per]);
             ctx.held_n = @min(it.depth, per);
         }
@@ -320,6 +345,8 @@ pub const Draft = struct {
             .hold = holdFn,
             .held = heldFn,
             .release = releaseFn,
+            .tree = treeFn,
+            .chances = chancesFn,
         } };
     }
 
@@ -342,6 +369,7 @@ pub const Draft = struct {
             .stream_bytes = d.streamBytes(),
             .window_costs = costs,
             .lane_costs = costs,
+            .tree_nodes = @intCast(d.tree_nodes),
         };
     }
 
@@ -362,6 +390,14 @@ pub const Draft = struct {
         const dtype: lanes.backend.Features.Dtype = if (m.act == .bf16) .bf16 else .f16;
         for (items) |it| {
             const o = d.streams.get(it.stream) orelse return error.UnknownStream;
+            if (it.offered > 0 and o.ctx.grown > 0) {
+                // the window carried the grown tree's first `offered` nodes: which landed prices the next ones
+                var prefix: [context.most_held + 1]u32 = undefined;
+                for (&prefix, 0..) |*x, i| x.* = @intCast(i);
+                const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
+                d.landing.observeTree(it.stream.sampling != null, o.ctx.parents[0..o.ctx.grown], o.ctx.own[0..o.ctx.grown], it.offered, kept);
+            }
+            o.ctx.grown = 0;
             const start = try absorbStart(it, d.c.n_taps * d.c.hidden * 2, dtype);
             const n = if (it.rows) |rs| rs.len else it.features.rows;
             try d.absorbRows(&o.ctx, it.features.buffer, m.taps.rows, start, n, it.rows);
@@ -392,6 +428,23 @@ pub const Draft = struct {
         }
     }
 
+    /// The grown tree as host tokens and node parents (-1: the pending token); null: the hold drafted a chain.
+    fn treeFn(p: *anyopaque, s: *Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
+        const d = cast(p);
+        const ctx = &(d.streams.get(s) orelse return error.UnknownStream).ctx;
+        if (ctx.grown == 0) return null;
+        const tokens = try gpa.dupe(u32, ctx.held[0..ctx.grown]);
+        errdefer gpa.free(tokens);
+        return .{ .count = @intCast(ctx.grown), .tokens = tokens, .parents = try gpa.dupe(i32, ctx.parents[0..ctx.grown]) };
+    }
+
+    /// A grown tree's nodes' chances: each its landing chance under its parent times its parent's.
+    fn chancesFn(p: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+        const d = cast(p);
+        const ctx = &(d.streams.get(s) orelse return error.UnknownStream).ctx;
+        return nodeChances(&d.landing, s.sampling != null, ctx, out);
+    }
+
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
@@ -403,6 +456,18 @@ pub const Draft = struct {
         total.* += ns;
     }
 };
+
+/// Rows a tree window holds at most: the target's window (the pending row and up to 15 nodes).
+const tree_window = 16;
+
+/// A grown tree's first `out.len` nodes' chances: landing chance by own log-chance, times the parent's; false: none.
+pub fn nodeChances(landing: *const walker.Landing, sampled: bool, ctx: *const Ctx, out: []f64) bool {
+    if (ctx.grown == 0 or out.len > ctx.grown) return false;
+    for (out, ctx.parents[0..out.len], ctx.own[0..out.len]) |*o, parent, own| {
+        o.* = landing.chance(sampled, own) * (if (parent >= 0) out[@intCast(parent)] else 1);
+    }
+    return true;
+}
 
 /// An absorb's first row's position: its `start`, which the target's features (its tap ring) name in `offset` too.
 pub fn absorbStart(it: dr.Absorb, row_bytes: usize, dtype: lanes.backend.Features.Dtype) !u64 {
@@ -478,4 +543,21 @@ test "16-bit logits widen by their kind" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, &out);
     widen(.f16, &.{ 0x3c00, 0xc000 }, &out);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, &out);
+}
+
+test "a grown tree's node chances multiply down the tree from a fresh landing's own chances" {
+    var ctx: Ctx = .{ .ring = 0 };
+    ctx.grown = 3;
+    ctx.parents[0..3].* = .{ -1, 0, -1 };
+    ctx.own[0..3].* = .{ -0.1, -0.2, -1.0 };
+    const landing: walker.Landing = .{};
+    var out: [3]f64 = undefined;
+    try std.testing.expect(nodeChances(&landing, false, &ctx, &out));
+    try std.testing.expectApproxEqAbs(@exp(@as(f64, -0.1)), out[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@exp(@as(f64, -0.3)), out[1], 1e-12);
+    try std.testing.expectApproxEqAbs(@exp(@as(f64, -1.0)), out[2], 1e-12);
+    var more: [4]f64 = undefined;
+    try std.testing.expect(!nodeChances(&landing, false, &ctx, &more));
+    ctx.grown = 0;
+    try std.testing.expect(!nodeChances(&landing, false, &ctx, out[0..1]));
 }

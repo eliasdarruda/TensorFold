@@ -15,6 +15,10 @@ pub const Ctx = struct {
     end: u64 = 0,
     held: [most_held]u32 = undefined,
     held_n: usize = 0,
+    /// A grown tree (draft_tree.grow): its nodes' parents (-1: the pending token) and own log-chances; 0: a chain.
+    parents: [most_held]i32 = undefined,
+    own: [most_held]f64 = undefined,
+    grown: usize = 0,
 
     /// The context emptied, its ring kept.
     pub fn clear(ctx: *Ctx) void {

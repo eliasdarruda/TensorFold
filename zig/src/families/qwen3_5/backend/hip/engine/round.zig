@@ -18,13 +18,14 @@ pub const Pick = enum(u32) { eager, replay, capture };
 /// What a verify hands back: the round's final rows, padding included.
 pub const Verified = struct { hidden: hip.ops.Tensor };
 
-/// One stream's rows of a round: tokens (the pending one, then drafts) from slot `pos` over its caches.
-pub const Rows = struct { caches: *state.Caches, pos: usize, tokens: []const u32, shift: i32 = 0 };
+/// One stream's rows of a round: tokens (the pending one, then drafts) from slot `pos` over its caches; `parents`
+/// makes them a tree (plan.Window).
+pub const Rows = struct { caches: *state.Caches, pos: usize, tokens: []const u32, shift: i32 = 0, parents: ?[]const i32 = null };
 
 const Chosen = struct { pick: Pick, entry: ?*round_graphs.Entry, shape: plan.Shape };
 
-/// The slots a keep names and the plan they index.
-const Last = struct { plan: hip.plan_ops.Plan, keep_at: usize, hidden: u64 };
+/// The slots a keep names and the plan they index; `kept_at` its kept paths' bytes, `full` the full layers' list.
+const Last = struct { plan: hip.plan_ops.Plan, keep_at: usize, kept_at: usize, hidden: u64, full: u64 };
 
 /// Keep lists in flight: a flush's pinned words stay until its copy has run, which a later round's sync guarantees.
 const keep_ring = 4;
@@ -36,9 +37,13 @@ pub const State = struct {
     /// Each linear layer's snapshots of the round in flight.
     snaps: [][2]u64,
     wins: []plan.Window,
-    /// The rows each slot keeps at the next flush (negative: not listed), and the pinned words they go up in.
+    /// The rows each slot keeps at the next flush (negative: not listed), their paths (plan.keptPath), and the
+    /// pinned words both go up in.
     staging: []i32,
+    paths: []u64,
     keeps: hip.HostBuffer,
+    /// The model's full-attention layers, for a tree keep's key and value moves.
+    full: []u32,
     ring: usize = 0,
     /// For checks: a layer-by-layer trace of the forward (graphs off), and a least bucket of rows.
     trace: ?fwd.Trace = null,
@@ -64,16 +69,26 @@ pub const State = struct {
         const staging = try e.gpa.alloc(i32, rows + 1);
         errdefer e.gpa.free(staging);
         @memset(staging, -1);
+        const paths = try e.gpa.alloc(u64, rows + 1);
+        errdefer e.gpa.free(paths);
+        @memset(paths, plan.chain_path);
+        var full: std.ArrayList(u32) = .empty;
+        errdefer full.deinit(e.gpa);
+        for (0..m.spec.n_layers) |i| if (m.spec.full(i)) try full.append(e.gpa, @intCast(i));
+        const full_layers = try full.toOwnedSlice(e.gpa);
+        errdefer e.gpa.free(full_layers);
         var votes: ?hip.Votes = if (e.o.world > 1) try hip.Votes.init(&e.driver, e.o.world) else null;
         errdefer if (votes) |*v| v.deinit();
-        const keeps = try hip.HostBuffer.alloc(&e.driver, keep_ring * 4 * (rows + 1));
+        const keeps = try hip.HostBuffer.alloc(&e.driver, keep_ring * keepBytes(rows));
         return .{
             .buffer = buffer,
             .scratch = scratch,
             .snaps = snaps,
             .wins = wins,
             .staging = staging,
+            .paths = paths,
             .keeps = keeps,
+            .full = full_layers,
             .votes = votes,
         };
     }
@@ -81,6 +96,8 @@ pub const State = struct {
     pub fn deinit(s: *State, e: *Engine) void {
         if (s.votes) |*v| v.deinit();
         s.keeps.free();
+        e.gpa.free(s.full);
+        e.gpa.free(s.paths);
         e.gpa.free(s.staging);
         e.gpa.free(s.wins);
         e.gpa.free(s.snaps);
@@ -88,6 +105,11 @@ pub const State = struct {
         s.buffer.deinit();
     }
 };
+
+/// Bytes of one flush's pinned keep words: each slot's count (i32), then each slot's path (u64).
+fn keepBytes(rows: usize) usize {
+    return std.mem.alignForward(usize, 4 * (rows + 1), 8) + 8 * (rows + 1);
+}
 
 /// The shape of a round of `rows`: its bucket of rows, its slots and the keys its walk covers.
 pub fn shapeOf(e: *Engine, rows: []const Rows) !plan.Shape {
@@ -143,14 +165,14 @@ pub fn verify(e: *Engine, rows: []const Rows, reqs: []const draw.Request, out: [
     for (rows, 0..) |r, i| {
         if (r.pos + r.tokens.len > r.caches.covered()) return error.ContextFull;
         for (r.tokens) |t| if (t >= m.spec.vocab) return error.InvalidQwenToken; // no kernel bounds an id
-        st.wins[i] = .{ .desc = r.caches.desc.base(), .pos = r.pos, .tokens = r.tokens, .shift = r.shift };
+        st.wins[i] = .{ .desc = r.caches.desc.base(), .pos = r.pos, .tokens = r.tokens, .shift = r.shift, .parents = r.parents };
         total += r.tokens.len;
     }
     e.rounds.reset();
     const o = e.ops(&e.rounds);
     try win.kept(o, m, c.shape.rows, st.snaps);
     const l = plan.Layout.of(c.shape.rows, c.shape.slots, m.spec.n_layers);
-    st.buffer.fill(l, c.shape, st.wins[0..rows.len], st.scratch.desc.base(), st.snaps);
+    try st.buffer.fill(l, c.shape, st.wins[0..rows.len], st.scratch.desc.base(), st.snaps, st.full);
     st.layout = l;
     const p: hip.plan_ops.Plan = .{ .args = st.buffer.args(l), .rows = c.shape.rows, .slots = c.shape.slots };
     const r: win.Round = .{ .plan = p, .tokens = st.buffer.dev.base() + 4 * l.tokens, .span = c.shape.span, .inputs = st.snaps, .positions3 = st.buffer.dev.base() + 4 * l.rope, .rotary = st.buffer.dev.base() + 4 * l.rotary };
@@ -158,7 +180,7 @@ pub fn verify(e: *Engine, rows: []const Rows, reqs: []const draw.Request, out: [
     e.graphs.rounds += 1;
     e.graphs.submit_ns += nowNs() - began;
     try e.drawRows(o, done.y, total, reqs, out, m.tp == null);
-    st.last = .{ .plan = p, .keep_at = 4 * l.keep, .hidden = done.hidden.ptr };
+    st.last = .{ .plan = p, .keep_at = 4 * l.keep, .kept_at = 4 * l.kept, .hidden = done.hidden.ptr, .full = st.buffer.dev.base() + 4 * l.full };
     return .{ .hidden = done.hidden };
 }
 
@@ -233,6 +255,14 @@ const Body = struct {
 /// Marks slot `slot` of the last verify to keep its first `rows` rows at the next `flush`.
 pub fn mark(e: *Engine, slot: usize, rows: usize) void {
     e.round.staging[slot] = @intCast(rows);
+    e.round.paths[slot] = plan.chain_path;
+}
+
+/// Marks slot `slot` of the last verify to keep a tree's path (rows from 0, ascending) at the next `flush`.
+pub fn markPath(e: *Engine, slot: usize, rows: []const u32) !void {
+    const path = try plan.keptPath(rows);
+    e.round.staging[slot] = @intCast(rows.len);
+    e.round.paths[slot] = path;
 }
 
 /// Keeps every marked slot of the last verify in one launch: linear states after the kept rows, last kept final rows.
@@ -244,11 +274,16 @@ pub fn flush(e: *Engine) !void {
     for (st.staging[0..slots]) |k| any = any or k >= 0;
     if (!any) return;
     const per = e.o.batch_rows + 1;
-    const from = 4 * st.ring * per;
-    const words = st.keeps.slice(i32)[st.ring * per ..][0..slots];
+    const from = st.ring * keepBytes(e.o.batch_rows);
+    const at_paths = from + std.mem.alignForward(usize, 4 * per, 8);
+    const words = std.mem.bytesAsSlice(i32, st.keeps.bytes[from..][0 .. 4 * slots]);
+    const paths = std.mem.bytesAsSlice(u64, st.keeps.bytes[at_paths..][0 .. 8 * slots]);
     st.ring = (st.ring + 1) % keep_ring;
     @memcpy(words, st.staging[0..slots]);
+    @memcpy(@as([]align(1) u64, paths), st.paths[0..slots]);
     @memset(st.staging[0..slots], -1);
+    @memset(st.paths[0..slots], plan.chain_path);
     try st.buffer.dev.uploadAsync(last.keep_at, st.keeps.view(from, from + 4 * slots), e.stream);
-    try win.keep(e.ops(&e.rounds), e.model(), last.plan, st.buffer.dev.base() + last.keep_at, last.hidden);
+    try st.buffer.dev.uploadAsync(last.kept_at, st.keeps.view(at_paths, at_paths + 8 * slots), e.stream);
+    try win.keep(e.ops(&e.rounds), e.model(), last.plan, st.buffer.dev.base() + last.keep_at, last.hidden, last.full);
 }

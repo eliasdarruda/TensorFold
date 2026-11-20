@@ -127,6 +127,7 @@ pub const Launcher = struct {
         attend: [2]Function,
         apply: [2]Function,
         keep: Function,
+        keep_kv: Function, // a tree keep's key and value moves
         gather: Function,
         gdn: [2]Function, // dk 128, 16
         gdn_replay: [2]Function, // dk 128, 16
@@ -221,6 +222,7 @@ pub const Launcher = struct {
             .attend = .{ try pl.function("tf_plan_attend_f16"), try pl.function("tf_plan_attend_bf16") },
             .apply = .{ try pl.function("tf_plan_apply_f16"), try pl.function("tf_plan_apply_bf16") },
             .keep = try pl.function("tf_plan_keep"),
+            .keep_kv = try pl.function("tf_plan_keep_kv"),
             .gather = try pl.function("tf_plan_gather"),
             .gdn = .{ try gd.function("tf_gdn_plan_128"), try gd.function("tf_gdn_plan_16") },
             .gdn_replay = .{ try gd.function("tf_gdn_replay_128"), try gd.function("tf_gdn_replay_16") },
@@ -393,6 +395,7 @@ pub const Launcher = struct {
     pub const planAttend = plan.planAttend;
     pub const planGatedDelta = plan.planGatedDelta;
     pub const planKeep = plan.planKeep;
+    pub const planKeepKv = plan.planKeepKv;
     pub const planGdnReplay = plan.planGdnReplay;
     pub const pagesWrite = plan.pagesWrite;
     pub const pagesGather = plan.pagesGather;
